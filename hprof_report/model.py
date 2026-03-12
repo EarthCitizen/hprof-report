@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from array import array
 from dataclasses import dataclass, field
 
 
@@ -13,11 +14,10 @@ class ClassInfo:
 
 @dataclass(slots=True)
 class ObjectRecord:
-    object_id: int
     kind: str
     class_id: int | None
     shallow_size: int
-    refs: list[int] = field(default_factory=list)
+    refs: array
     display_type: str | None = None
 
 
@@ -25,11 +25,12 @@ class ObjectRecord:
 class HeapSnapshot:
     id_size: int
     version: str
-    strings: dict[int, str] = field(default_factory=dict)
+    strings: dict[int, bytes | str] = field(default_factory=dict)
     class_name_ids: dict[int, int] = field(default_factory=dict)
     classes: dict[int, ClassInfo] = field(default_factory=dict)
     objects: dict[int, ObjectRecord] = field(default_factory=dict)
     roots: set[int] = field(default_factory=set)
+    create_placeholders: bool = False
 
     def ensure_object(
         self,
@@ -53,10 +54,10 @@ class HeapSnapshot:
             return existing
 
         record = ObjectRecord(
-            object_id=object_id,
             kind=kind,
             class_id=class_id,
             shallow_size=shallow_size,
+            refs=self._new_ref_array(),
             display_type=display_type,
         )
         self.objects[object_id] = record
@@ -67,7 +68,8 @@ class HeapSnapshot:
             return
         source = self.ensure_object(source_id)
         source.refs.append(target_id)
-        self.ensure_object(target_id)
+        if self.create_placeholders:
+            self.ensure_object(target_id)
 
     def get_class_name(self, class_id: int | None) -> str:
         if class_id is None:
@@ -75,8 +77,15 @@ class HeapSnapshot:
         name_id = self.class_name_ids.get(class_id)
         if name_id is None:
             return f"<class@0x{class_id:x}>"
-        raw = self.strings.get(name_id, f"<string@0x{name_id:x}>")
-        return pretty_class_name(raw)
+        raw = self.strings.get(name_id)
+        if raw is None:
+            return f"<string@0x{name_id:x}>"
+        if isinstance(raw, bytes):
+            text = raw.decode("utf-8", errors="replace")
+            self.strings[name_id] = text
+        else:
+            text = raw
+        return pretty_class_name(text)
 
     def object_type_name(self, obj: ObjectRecord) -> str:
         if obj.display_type:
@@ -90,6 +99,9 @@ class HeapSnapshot:
         if obj.kind == "primitive_array":
             return "primitive[]"
         return "<unknown>"
+
+    def _new_ref_array(self) -> array:
+        return array("I") if self.id_size == 4 else array("Q")
 
 
 _PRIMITIVE_DESC = {
@@ -117,4 +129,3 @@ def pretty_class_name(raw: str) -> str:
             base = _PRIMITIVE_DESC.get(comp, comp)
         return base + "[]" * dims
     return raw.replace("/", ".")
-

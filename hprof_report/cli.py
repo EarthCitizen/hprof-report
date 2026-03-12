@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import time
 
 from .analyzer import AnalysisResult, analyze_snapshot
 from .parser import HprofParser
@@ -11,10 +12,20 @@ from .parser import HprofParser
 
 def main() -> int:
     args = _build_parser().parse_args()
+    progress = _ProgressPrinter() if args.verbose else None
 
-    parser = HprofParser(include_unreachable_roots=args.include_unreachable_roots)
+    if progress is not None:
+        progress(f"Opening heap dump: {args.hprof_file}")
+    parser = HprofParser(include_unreachable_roots=args.include_unreachable_roots, progress=progress)
     snapshot = parser.parse(args.hprof_file)
-    result = analyze_snapshot(snapshot, top_n=args.top, include_dominator=not args.no_dominator)
+    result = analyze_snapshot(
+        snapshot,
+        top_n=args.top,
+        include_dominator=not args.no_dominator,
+        progress=progress,
+    )
+    if progress is not None:
+        progress("Rendering final report")
 
     if args.format == "json":
         _print_json(result, args.hprof_file)
@@ -48,6 +59,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--include-unreachable-roots",
         action="store_true",
         help="Treat HPROF ROOT_UNREACHABLE records as roots (off by default).",
+    )
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print phase timings and periodic progress updates to stderr.",
     )
     return p
 
@@ -149,6 +165,14 @@ def _human_bytes(value: int) -> str:
     return f"{size:.2f} PiB"
 
 
+class _ProgressPrinter:
+    def __init__(self) -> None:
+        self._start_time = time.perf_counter()
+
+    def __call__(self, message: str) -> None:
+        elapsed = time.perf_counter() - self._start_time
+        print(f"[{elapsed:7.2f}s] {message}", file=sys.stderr, flush=True)
+
+
 if __name__ == "__main__":
     sys.exit(main())
-

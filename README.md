@@ -37,7 +37,10 @@ hprof-report /path/to/heapdump.hprof --top 30
 hprof-report /path/to/heapdump.hprof --format json
 hprof-report /path/to/heapdump.hprof --no-dominator
 hprof-report /path/to/heapdump.hprof --include-unreachable-roots
+hprof-report /path/to/heapdump.hprof --verbose
 ```
+
+`--verbose` prints periodic progress and phase timing to stderr so you can tell it is still working on large dumps.
 
 ## Example Output (text)
 
@@ -68,6 +71,7 @@ Top object retainers (approximate retained size):
   - primitive arrays: `length * primitive_size`
 - Object-header and alignment overhead are not reconstructed, so values are best for relative ranking.
 - Dominator retained sizes are approximate and can be expensive on very large dumps; use `--no-dominator` for faster class-only output.
+- For very large dumps, use `--verbose` to monitor parser/analysis progress and timings.
 - Parser supports standard HPROF records used by HotSpot/OpenJDK heap dumps (`STRING`, `LOAD_CLASS`, `HEAP_DUMP`, `HEAP_DUMP_SEGMENT` and core heap sub-records).
 
 ## Development
@@ -75,5 +79,5 @@ Top object retainers (approximate retained size):
 Run tests:
 
 ```bash
-python -m unittest discover -s tests -p "test_*.py"
+python3 -m unittest discover -s tests -p "test_*.py"
 ```
