@@ -11,27 +11,31 @@ from .parser import HprofParser
 
 
 def main() -> int:
-    args = _build_parser().parse_args()
-    progress = _ProgressPrinter() if args.verbose else None
+    try:
+        args = _build_parser().parse_args()
+        progress = _ProgressPrinter() if args.verbose else None
 
-    if progress is not None:
-        progress(f"Opening heap dump: {args.hprof_file}")
-    parser = HprofParser(include_unreachable_roots=args.include_unreachable_roots, progress=progress)
-    snapshot = parser.parse(args.hprof_file)
-    result = analyze_snapshot(
-        snapshot,
-        top_n=args.top,
-        include_dominator=not args.no_dominator,
-        progress=progress,
-    )
-    if progress is not None:
-        progress("Rendering final report")
+        if progress is not None:
+            progress(f"Opening heap dump: {args.hprof_file}")
+        parser = HprofParser(include_unreachable_roots=args.include_unreachable_roots, progress=progress)
+        snapshot = parser.parse(args.hprof_file)
+        result = analyze_snapshot(
+            snapshot,
+            top_n=args.top,
+            include_dominator=not args.no_dominator,
+            progress=progress,
+        )
+        if progress is not None:
+            progress("Rendering final report")
 
-    if args.format == "json":
-        _print_json(result, args.hprof_file)
-    else:
-        _print_text(result, Path(args.hprof_file))
-    return 0
+        if args.format == "json":
+            _print_json(result, args.hprof_file)
+        else:
+            _print_text(result, Path(args.hprof_file))
+        return 0
+    except KeyboardInterrupt:
+        print("Interrupted by user (Ctrl+C).", file=sys.stderr, flush=True)
+        return 130
 
 
 def _build_parser() -> argparse.ArgumentParser:

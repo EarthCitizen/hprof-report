@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import io
 import struct
+import sys
 import tempfile
 import unittest
+from unittest import mock
+from contextlib import redirect_stderr
 
 from hprof_report.analyzer import analyze_snapshot
+from hprof_report import cli
 from hprof_report.model import HeapSnapshot
 from hprof_report.parser import HprofParser
 
@@ -221,6 +226,17 @@ class MinimalHprofTests(unittest.TestCase):
         self.assertIsNone(rows_by_id[0xC].held_by_object_id)
         self.assertEqual(rows_by_id[0xC].held_by_type_name, "GC_ROOT")
         self.assertEqual(rows_by_id[0xD].held_by_object_id, 0xC)
+
+    def test_cli_ctrl_c_is_clean(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", ["hprof-report", "/tmp/nonexistent.hprof"]),
+            mock.patch.object(cli.HprofParser, "parse", side_effect=KeyboardInterrupt),
+            redirect_stderr(stderr),
+        ):
+            code = cli.main()
+        self.assertEqual(code, 130)
+        self.assertIn("Interrupted by user (Ctrl+C).", stderr.getvalue())
 
 
 if __name__ == "__main__":
