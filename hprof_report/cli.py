@@ -1,0 +1,154 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import sys
+
+from .analyzer import AnalysisResult, analyze_snapshot
+from .parser import HprofParser
+
+
+def main() -> int:
+    args = _build_parser().parse_args()
+
+    parser = HprofParser(include_unreachable_roots=args.include_unreachable_roots)
+    snapshot = parser.parse(args.hprof_file)
+    result = analyze_snapshot(snapshot, top_n=args.top, include_dominator=not args.no_dominator)
+
+    if args.format == "json":
+        _print_json(result, args.hprof_file)
+    else:
+        _print_text(result, Path(args.hprof_file))
+    return 0
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="hprof-report",
+        description=(
+            "Read a JVM HPROF heap dump and report memory retained by objects "
+            "reachable from GC roots (non-collectable at snapshot time)."
+        ),
+    )
+    p.add_argument("hprof_file", help="Path to .hprof heap dump")
+    p.add_argument("--top", type=int, default=20, help="How many entries to show in each ranking (default: 20)")
+    p.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format (default: text)",
+    )
+    p.add_argument(
+        "--no-dominator",
+        action="store_true",
+        help="Skip retained-size dominator calculation (faster, only class summary).",
+    )
+    p.add_argument(
+        "--include-unreachable-roots",
+        action="store_true",
+        help="Treat HPROF ROOT_UNREACHABLE records as roots (off by default).",
+    )
+    return p
+
+
+def _print_text(result: AnalysisResult, source: Path) -> None:
+    print(f"File: {source}")
+    print(f"Objects parsed: {result.object_count:,}")
+    print(f"GC roots: {result.root_count:,}")
+    print(f"Total shallow heap: {_human_bytes(result.total_shallow_size)}")
+    print(
+        "Non-collectable shallow heap: "
+        f"{_human_bytes(result.non_collectable_size)} "
+        f"({result.reachable_count:,} objects reachable from GC roots)"
+    )
+
+    print()
+    print("Top classes by non-collectable shallow size:")
+    _print_class_table(result)
+
+    if result.top_retainers:
+        print()
+        print("Top object retainers (approximate retained size):")
+        _print_retainer_table(result)
+
+
+def _print_json(result: AnalysisResult, source: str) -> None:
+    payload = {
+        "file": source,
+        "object_count": result.object_count,
+        "root_count": result.root_count,
+        "total_shallow_size": result.total_shallow_size,
+        "reachable_count": result.reachable_count,
+        "non_collectable_size": result.non_collectable_size,
+        "class_summaries": [
+            {
+                "type_name": row.type_name,
+                "object_count": row.object_count,
+                "shallow_size": row.shallow_size,
+            }
+            for row in result.class_summaries
+        ],
+        "top_retainers": [
+            {
+                "object_id": f"0x{row.object_id:x}",
+                "type_name": row.type_name,
+                "shallow_size": row.shallow_size,
+                "retained_size": row.retained_size,
+            }
+            for row in result.top_retainers
+        ],
+    }
+    print(json.dumps(payload, indent=2))
+
+
+def _print_class_table(result: AnalysisResult) -> None:
+    if not result.class_summaries:
+        print("  (none)")
+        return
+
+    rank_w = max(4, len(str(len(result.class_summaries))))
+    obj_w = max(7, max(len(f"{row.object_count:,}") for row in result.class_summaries))
+    size_w = max(10, max(len(_human_bytes(row.shallow_size)) for row in result.class_summaries))
+
+    print(f"{'#':>{rank_w}}  {'Objects':>{obj_w}}  {'Shallow':>{size_w}}  Type")
+    for idx, row in enumerate(result.class_summaries, start=1):
+        print(
+            f"{idx:>{rank_w}}  "
+            f"{row.object_count:>{obj_w},}  "
+            f"{_human_bytes(row.shallow_size):>{size_w}}  "
+            f"{row.type_name}"
+        )
+
+
+def _print_retainer_table(result: AnalysisResult) -> None:
+    rank_w = max(4, len(str(len(result.top_retainers))))
+    shallow_w = max(10, max(len(_human_bytes(row.shallow_size)) for row in result.top_retainers))
+    retained_w = max(10, max(len(_human_bytes(row.retained_size)) for row in result.top_retainers))
+
+    print(f"{'#':>{rank_w}}  {'Retained':>{retained_w}}  {'Shallow':>{shallow_w}}  {'Object ID':>18}  Type")
+    for idx, row in enumerate(result.top_retainers, start=1):
+        print(
+            f"{idx:>{rank_w}}  "
+            f"{_human_bytes(row.retained_size):>{retained_w}}  "
+            f"{_human_bytes(row.shallow_size):>{shallow_w}}  "
+            f"{f'0x{row.object_id:x}':>18}  "
+            f"{row.type_name}"
+        )
+
+
+def _human_bytes(value: int) -> str:
+    if value < 1024:
+        return f"{value} B"
+    units = ("KiB", "MiB", "GiB", "TiB")
+    size = float(value)
+    for unit in units:
+        size /= 1024.0
+        if size < 1024.0:
+            return f"{size:.2f} {unit}"
+    return f"{size:.2f} PiB"
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+

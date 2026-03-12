@@ -1,0 +1,22 @@
+[project]
+name = "hprof-report"
+version = "0.1.0"
+description = "Analyze JVM HPROF heap dumps and report non-collectable memory."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "hprof-report" }
+]
+dependencies = []
+
+[project.scripts]
+hprof-report = "hprof_report.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hprof_report*"]
+
