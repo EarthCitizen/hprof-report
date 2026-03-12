@@ -111,6 +111,13 @@ def _print_json(result: AnalysisResult, source: str) -> None:
                 "type_name": row.type_name,
                 "shallow_size": row.shallow_size,
                 "retained_size": row.retained_size,
+                "held_by_object_id": f"0x{row.held_by_object_id:x}" if row.held_by_object_id is not None else None,
+                "held_by_type_name": row.held_by_type_name,
+                "retainer_chain": [
+                    {"object_id": f"0x{node.object_id:x}", "type_name": node.type_name}
+                    for node in row.retainer_chain
+                ],
+                "retainer_chain_truncated": row.retainer_chain_truncated,
             }
             for row in result.top_retainers
         ],
@@ -151,6 +158,23 @@ def _print_retainer_table(result: AnalysisResult) -> None:
             f"{f'0x{row.object_id:x}':>18}  "
             f"{row.type_name}"
         )
+        if row.held_by_object_id is None:
+            held_by = "GC_ROOT"
+        else:
+            held_by = f"0x{row.held_by_object_id:x} {row.held_by_type_name}"
+        print(f"{'':>{rank_w}}  held_by: {held_by}")
+        print(f"{'':>{rank_w}}  chain: {_format_retainer_chain(row)}")
+
+
+def _format_retainer_chain(row) -> str:
+    if not row.retainer_chain:
+        return "GC_ROOT"
+    parts = ["GC_ROOT"]
+    for node in row.retainer_chain:
+        parts.append(f"0x{node.object_id:x}({node.type_name})")
+    if row.retainer_chain_truncated:
+        parts.append("...")
+    return " -> ".join(parts)
 
 
 def _human_bytes(value: int) -> str:

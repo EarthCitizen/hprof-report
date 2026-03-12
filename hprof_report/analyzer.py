@@ -21,6 +21,10 @@ class RetainerSummary:
     type_name: str
     shallow_size: int
     retained_size: int
+    held_by_object_id: int | None
+    held_by_type_name: str
+    retainer_chain: list["RetainerChainNode"]
+    retainer_chain_truncated: bool
 
 
 @dataclass(slots=True)
@@ -32,6 +36,12 @@ class AnalysisResult:
     non_collectable_size: int
     class_summaries: list[ClassSummary]
     top_retainers: list[RetainerSummary]
+
+
+@dataclass(slots=True)
+class RetainerChainNode:
+    object_id: int
+    type_name: str
 
 
 ProgressCallback = Callable[[str], None]
@@ -242,12 +252,35 @@ def _compute_top_retainers(
     for idx in top_indexes:
         obj_id = node_ids[idx]
         obj = objects[obj_id]
+        held_by_object_id: int | None
+        held_by_type_name: str
+        parent_idx = idom[idx]
+        if parent_idx == root_idx or parent_idx == -1:
+            held_by_object_id = None
+            held_by_type_name = "GC_ROOT"
+        else:
+            held_by_object_id = node_ids[parent_idx]
+            held_by_type_name = _cached_object_type_name(snapshot, objects[held_by_object_id], type_name_cache)
+
+        chain_nodes, chain_truncated = _build_retainer_chain(
+            idx=idx,
+            idom=idom,
+            node_ids=node_ids,
+            root_idx=root_idx,
+            objects=objects,
+            snapshot=snapshot,
+            type_name_cache=type_name_cache,
+        )
         out.append(
             RetainerSummary(
                 object_id=obj_id,
                 type_name=_cached_object_type_name(snapshot, obj, type_name_cache),
                 shallow_size=shallow[idx],
                 retained_size=retained[idx],
+                held_by_object_id=held_by_object_id,
+                held_by_type_name=held_by_type_name,
+                retainer_chain=chain_nodes,
+                retainer_chain_truncated=chain_truncated,
             )
         )
     if progress is not None:
@@ -372,3 +405,38 @@ def _cached_object_type_name(
     name = snapshot.object_type_name(obj)
     cache[key] = name
     return name
+
+
+def _build_retainer_chain(
+    *,
+    idx: int,
+    idom: list[int],
+    node_ids: list[int],
+    root_idx: int,
+    objects: dict[int, ObjectRecord],
+    snapshot: HeapSnapshot,
+    type_name_cache: dict[tuple[str, int | None, str | None], str],
+    max_depth: int = 32,
+) -> tuple[list[RetainerChainNode], bool]:
+    chain_ids: list[int] = []
+    current = idx
+    depth = 0
+    truncated = False
+    while current != root_idx and current != -1:
+        chain_ids.append(node_ids[current])
+        current = idom[current]
+        depth += 1
+        if depth >= max_depth:
+            if current not in (root_idx, -1):
+                truncated = True
+            break
+
+    chain_ids.reverse()
+    chain_nodes = [
+        RetainerChainNode(
+            object_id=obj_id,
+            type_name=_cached_object_type_name(snapshot, objects[obj_id], type_name_cache),
+        )
+        for obj_id in chain_ids
+    ]
+    return chain_nodes, truncated

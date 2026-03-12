@@ -143,6 +143,9 @@ class MinimalHprofTests(unittest.TestCase):
             self.assertTrue(result.top_retainers)
             self.assertEqual(result.top_retainers[0].object_id, 0x200)
             self.assertEqual(result.top_retainers[0].retained_size, 8)
+            self.assertIsNone(result.top_retainers[0].held_by_object_id)
+            self.assertEqual(result.top_retainers[0].held_by_type_name, "GC_ROOT")
+            self.assertEqual([node.object_id for node in result.top_retainers[0].retainer_chain], [0x200])
 
     def test_include_unreachable_root_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -191,6 +194,8 @@ class MinimalHprofTests(unittest.TestCase):
             self.assertTrue(result.top_retainers)
             self.assertEqual(result.top_retainers[0].object_id, 0x500)
             self.assertEqual(result.top_retainers[0].retained_size, 16)
+            self.assertIsNone(result.top_retainers[0].held_by_object_id)
+            self.assertEqual(result.top_retainers[0].held_by_type_name, "GC_ROOT")
 
     def test_dominator_on_converging_graph(self) -> None:
         snapshot = HeapSnapshot(id_size=4, version="test")
@@ -211,6 +216,11 @@ class MinimalHprofTests(unittest.TestCase):
         self.assertEqual(retained_by_id[0xB], 4)
         self.assertEqual(retained_by_id[0xC], 8)
         self.assertEqual(retained_by_id[0xD], 4)
+
+        rows_by_id = {row.object_id: row for row in result.top_retainers}
+        self.assertIsNone(rows_by_id[0xC].held_by_object_id)
+        self.assertEqual(rows_by_id[0xC].held_by_type_name, "GC_ROOT")
+        self.assertEqual(rows_by_id[0xD].held_by_object_id, 0xC)
 
 
 if __name__ == "__main__":

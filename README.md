@@ -60,7 +60,11 @@ Top classes by non-collectable shallow size:
 Top object retainers (approximate retained size):
    #    Retained     Shallow           Object ID  Type
    1  1.14 GiB      56 B              0x7f8c99a8  com.myapp.BigCache
+      held_by: GC_ROOT
+      chain: GC_ROOT -> 0x7f8c99a8(com.myapp.BigCache)
    2  0.63 GiB      80 B              0x7f2d11c0  java.util.HashMap
+      held_by: 0x7f8c99a8 com.myapp.BigCache
+      chain: GC_ROOT -> 0x7f8c99a8(com.myapp.BigCache) -> 0x7f2d11c0(java.util.HashMap)
 ```
 
 ## Notes and limitations
