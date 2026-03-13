@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import math
 import mmap
 from pathlib import Path
 import struct
@@ -77,6 +79,7 @@ class _PendingInstance:
 
 
 ProgressCallback = Callable[[str], None]
+PARSER_PARALLEL_PENDING_MIN = 100_000
 
 
 class HprofParser:
@@ -85,11 +88,13 @@ class HprofParser:
         *,
         include_unreachable_roots: bool = False,
         progress: ProgressCallback | None = None,
+        workers: int = 1,
         progress_interval_seconds: float = 2.0,
         progress_interval_bytes: int = 64 * 1024 * 1024,
     ) -> None:
         self.include_unreachable_roots = include_unreachable_roots
         self.progress = progress
+        self.workers = max(1, int(workers))
         self.progress_interval_seconds = max(0.1, progress_interval_seconds)
         self.progress_interval_bytes = max(1024 * 1024, progress_interval_bytes)
 
@@ -436,15 +441,42 @@ class HprofParser:
         if self.progress is not None:
             self.progress(f"Parser: resolving {len(self._pending_instances):,} deferred instances")
         unresolved: list[_PendingInstance] = []
+        resolved: list[tuple[int, bytes, tuple[int, ...]]] = []
         for pending in self._pending_instances:
             ref_offsets = self._get_instance_ref_offsets(snapshot, pending.class_id)
             if ref_offsets is None:
                 unresolved.append(pending)
                 continue
-            obj = snapshot.objects.get(pending.object_id)
-            if obj is None:
-                continue
-            self._append_instance_refs(obj, pending.raw_data, ref_offsets, snapshot.id_size)
+            resolved.append((pending.object_id, pending.raw_data, ref_offsets))
+
+        if self.workers > 1 and len(resolved) >= PARSER_PARALLEL_PENDING_MIN:
+            if self.progress is not None:
+                self.progress(f"Parser: parallel deferred-instance resolution with {self.workers} workers")
+            chunk_size = max(20_000, math.ceil(len(resolved) / self.workers))
+            chunks: list[list[tuple[int, bytes, tuple[int, ...]]]] = []
+            start = 0
+            while start < len(resolved):
+                end = min(len(resolved), start + chunk_size)
+                chunks.append(resolved[start:end])
+                start = end
+
+            extracted: list[tuple[int, list[int]]] = []
+            with ThreadPoolExecutor(max_workers=self.workers) as pool:
+                futures = [pool.submit(_extract_pending_refs_chunk, chunk, snapshot.id_size) for chunk in chunks]
+                for fut in futures:
+                    extracted.extend(fut.result())
+
+            for object_id, refs in extracted:
+                obj = snapshot.objects.get(object_id)
+                if obj is not None and refs:
+                    obj.refs.extend(refs)
+        else:
+            for object_id, raw_data, ref_offsets in resolved:
+                obj = snapshot.objects.get(object_id)
+                if obj is None:
+                    continue
+                self._append_instance_refs(obj, raw_data, ref_offsets, snapshot.id_size)
+
         self._pending_instances = unresolved
         if unresolved and self.progress is not None:
             self.progress(
@@ -665,3 +697,37 @@ def _format_bytes(value: int) -> str:
         if size < 1024.0:
             return f"{size:.2f} {unit}"
     return f"{size:.2f} PiB"
+
+
+def _extract_pending_refs_chunk(
+    chunk: list[tuple[int, bytes, tuple[int, ...]]],
+    id_size: int,
+) -> list[tuple[int, list[int]]]:
+    out: list[tuple[int, list[int]]] = []
+    if id_size == 4:
+        unpack_from = struct.unpack_from
+        width = 4
+        for object_id, raw_data, ref_offsets in chunk:
+            refs: list[int] = []
+            data_size = len(raw_data)
+            for offset in ref_offsets:
+                if offset + width > data_size:
+                    break
+                ref_id = unpack_from(">I", raw_data, offset)[0]
+                if ref_id != 0:
+                    refs.append(ref_id)
+            out.append((object_id, refs))
+    else:
+        unpack_from = struct.unpack_from
+        width = 8
+        for object_id, raw_data, ref_offsets in chunk:
+            refs = []
+            data_size = len(raw_data)
+            for offset in ref_offsets:
+                if offset + width > data_size:
+                    break
+                ref_id = unpack_from(">Q", raw_data, offset)[0]
+                if ref_id != 0:
+                    refs.append(ref_id)
+            out.append((object_id, refs))
+    return out

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import math
 from pathlib import Path
 import shutil
 import tempfile
@@ -11,6 +13,7 @@ from .model import HeapSnapshot
 
 
 ProgressCallback = Callable[[str], None]
+CSR_PARALLEL_MIN = 200_000
 
 
 class MemmapAdjacency:
@@ -53,6 +56,7 @@ def build_disk_adjacency(
     root_idx: int,
     *,
     work_dir: str | Path | None = None,
+    workers: int = 1,
     progress: ProgressCallback | None = None,
 ) -> DiskAdjacencyStore:
     try:
@@ -113,41 +117,91 @@ def build_disk_adjacency(
     succ_targets = _create_targets_array(np, base_dir / "succ_targets.bin", total_edges)
     pred_targets = _create_targets_array(np, base_dir / "pred_targets.bin", total_edges)
 
-    succ_cursor = np.memmap(base_dir / "succ_cursor.bin", dtype=np.uint64, mode="w+", shape=(row_count,))
-    pred_cursor = np.memmap(base_dir / "pred_cursor.bin", dtype=np.uint64, mode="w+", shape=(row_count,))
-    succ_cursor[:] = succ_offsets[:-1]
-    pred_cursor[:] = pred_offsets[:-1]
-
-    last_report = time.perf_counter()
-    for idx, obj_id in enumerate(node_ids):
-        obj = objects_get(obj_id)
-        for ref_id in obj.refs:
-            target = node_index_get(ref_id)
-            if target is None:
+    parallel_workers = max(1, int(workers))
+    if parallel_workers > 1 and len(node_ids) >= CSR_PARALLEL_MIN:
+        if progress is not None:
+            progress(f"Disk graph: materializing successor edges with {parallel_workers} workers")
+        _fill_successors_parallel(
+            node_ids=node_ids,
+            objects_get=objects_get,
+            node_index_get=node_index_get,
+            succ_offsets=succ_offsets,
+            succ_targets=succ_targets,
+            worker_count=parallel_workers,
+        )
+        # Add synthetic-root successor edges after worker fill.
+        root_write_pos = int(succ_offsets[root_idx])
+        for root_obj_id in snapshot.roots:
+            idx = node_index_get(root_obj_id)
+            if idx is None:
                 continue
-            succ_pos = int(succ_cursor[idx])
-            pred_pos = int(pred_cursor[target])
-            succ_targets[succ_pos] = target
-            pred_targets[pred_pos] = idx
-            succ_cursor[idx] = succ_pos + 1
-            pred_cursor[target] = pred_pos + 1
+            succ_targets[root_write_pos] = idx
+            root_write_pos += 1
 
-        if progress is not None and idx % 500_000 == 0 and idx > 0:
-            now = time.perf_counter()
-            if (now - last_report) >= 1.5:
-                progress(f"Disk graph: materialized edges for {idx:,}/{len(node_ids):,} nodes")
-                last_report = now
+        if progress is not None:
+            progress("Disk graph: building predecessor index from successors")
+        pred_cursor = np.memmap(base_dir / "pred_cursor.bin", dtype=np.uint64, mode="w+", shape=(row_count,))
+        pred_cursor[:] = pred_offsets[:-1]
 
-    for root_obj_id in snapshot.roots:
-        idx = node_index_get(root_obj_id)
-        if idx is None:
-            continue
-        succ_pos = int(succ_cursor[root_idx])
-        pred_pos = int(pred_cursor[idx])
-        succ_targets[succ_pos] = idx
-        pred_targets[pred_pos] = root_idx
-        succ_cursor[root_idx] = succ_pos + 1
-        pred_cursor[idx] = pred_pos + 1
+        last_report = time.perf_counter()
+        for src in range(row_count):
+            start = int(succ_offsets[src])
+            end = int(succ_offsets[src + 1])
+            for edge_pos in range(start, end):
+                target = int(succ_targets[edge_pos])
+                pred_pos = int(pred_cursor[target])
+                pred_targets[pred_pos] = src
+                pred_cursor[target] = pred_pos + 1
+
+            if progress is not None and src % 500_000 == 0 and src > 0:
+                now = time.perf_counter()
+                if (now - last_report) >= 1.5:
+                    progress(f"Disk graph: predecessor build {src:,}/{row_count:,} rows")
+                    last_report = now
+
+        _close_array(pred_cursor)
+        (base_dir / "pred_cursor.bin").unlink(missing_ok=True)
+    else:
+        succ_cursor = np.memmap(base_dir / "succ_cursor.bin", dtype=np.uint64, mode="w+", shape=(row_count,))
+        pred_cursor = np.memmap(base_dir / "pred_cursor.bin", dtype=np.uint64, mode="w+", shape=(row_count,))
+        succ_cursor[:] = succ_offsets[:-1]
+        pred_cursor[:] = pred_offsets[:-1]
+
+        last_report = time.perf_counter()
+        for idx, obj_id in enumerate(node_ids):
+            obj = objects_get(obj_id)
+            for ref_id in obj.refs:
+                target = node_index_get(ref_id)
+                if target is None:
+                    continue
+                succ_pos = int(succ_cursor[idx])
+                pred_pos = int(pred_cursor[target])
+                succ_targets[succ_pos] = target
+                pred_targets[pred_pos] = idx
+                succ_cursor[idx] = succ_pos + 1
+                pred_cursor[target] = pred_pos + 1
+
+            if progress is not None and idx % 500_000 == 0 and idx > 0:
+                now = time.perf_counter()
+                if (now - last_report) >= 1.5:
+                    progress(f"Disk graph: materialized edges for {idx:,}/{len(node_ids):,} nodes")
+                    last_report = now
+
+        for root_obj_id in snapshot.roots:
+            idx = node_index_get(root_obj_id)
+            if idx is None:
+                continue
+            succ_pos = int(succ_cursor[root_idx])
+            pred_pos = int(pred_cursor[idx])
+            succ_targets[succ_pos] = idx
+            pred_targets[pred_pos] = root_idx
+            succ_cursor[root_idx] = succ_pos + 1
+            pred_cursor[idx] = pred_pos + 1
+
+        _close_array(succ_cursor)
+        _close_array(pred_cursor)
+        (base_dir / "succ_cursor.bin").unlink(missing_ok=True)
+        (base_dir / "pred_cursor.bin").unlink(missing_ok=True)
 
     succ_offsets.flush()
     pred_offsets.flush()
@@ -155,11 +209,6 @@ def build_disk_adjacency(
         succ_targets.flush()
     if hasattr(pred_targets, "flush"):
         pred_targets.flush()
-
-    _close_array(succ_cursor)
-    _close_array(pred_cursor)
-    (base_dir / "succ_cursor.bin").unlink(missing_ok=True)
-    (base_dir / "pred_cursor.bin").unlink(missing_ok=True)
 
     store = DiskAdjacencyStore(
         succ=MemmapAdjacency(succ_offsets, succ_targets),
@@ -178,6 +227,43 @@ def _create_targets_array(np, path: Path, total_edges: int):
     if total_edges == 0:
         return np.empty((0,), dtype=np.uint32)
     return np.memmap(path, dtype=np.uint32, mode="w+", shape=(total_edges,))
+
+
+def _fill_successors_parallel(
+    *,
+    node_ids: list[int],
+    objects_get,
+    node_index_get,
+    succ_offsets,
+    succ_targets,
+    worker_count: int,
+) -> None:
+    total = len(node_ids)
+    if total == 0:
+        return
+    chunk_size = max(100_000, math.ceil(total / worker_count))
+
+    def worker(start: int, end: int) -> None:
+        for idx in range(start, end):
+            obj = objects_get(node_ids[idx])
+            write_pos = int(succ_offsets[idx])
+            for ref_id in obj.refs:
+                target = node_index_get(ref_id)
+                if target is not None:
+                    succ_targets[write_pos] = target
+                    write_pos += 1
+
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    while start < total:
+        end = min(total, start + chunk_size)
+        ranges.append((start, end))
+        start = end
+
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        futures = [pool.submit(worker, start, end) for start, end in ranges]
+        for fut in futures:
+            fut.result()
 
 
 def _close_array(arr) -> None:

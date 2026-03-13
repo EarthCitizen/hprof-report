@@ -42,6 +42,10 @@ fi
 EXTRA_ARGS=()
 HAS_ENGINE_ARG=0
 HAS_MAX_MEMORY_ARG=0
+HAS_WORKERS_ARG=0
+HAS_WORK_DIR_ARG=0
+HAS_CACHE_ARG=0
+HAS_CACHE_DIR_ARG=0
 for arg in "$@"; do
   if [[ "$arg" == "--engine" || "$arg" == --engine=* ]]; then
     HAS_ENGINE_ARG=1
@@ -49,9 +53,25 @@ for arg in "$@"; do
   if [[ "$arg" == "--max-memory-gb" || "$arg" == --max-memory-gb=* ]]; then
     HAS_MAX_MEMORY_ARG=1
   fi
+  if [[ "$arg" == "--workers" || "$arg" == --workers=* ]]; then
+    HAS_WORKERS_ARG=1
+  fi
+  if [[ "$arg" == "--work-dir" || "$arg" == --work-dir=* ]]; then
+    HAS_WORK_DIR_ARG=1
+  fi
+  if [[ "$arg" == "--cache" || "$arg" == "--no-cache" ]]; then
+    HAS_CACHE_ARG=1
+  fi
+  if [[ "$arg" == "--cache-dir" || "$arg" == --cache-dir=* ]]; then
+    HAS_CACHE_DIR_ARG=1
+  fi
 done
 
 CLI_HELP="$("$VENV_PYTHON" -m hprof_report.cli --help 2>/dev/null || true)"
+
+HPCACHE_ROOT="${HPROF_CACHE_ROOT:-$SCRIPT_DIR/.hprof-cache}"
+HPCACHE_RESULTS="${HPROF_CACHE_DIR:-$HPCACHE_ROOT/results}"
+HPCACHE_TMP="${HPROF_WORK_DIR:-$HPCACHE_ROOT/tmp}"
 
 if [[ "$HAS_ENGINE_ARG" -eq 0 ]]; then
   if printf '%s\n' "$CLI_HELP" | grep -q -- "--engine"; then
@@ -64,6 +84,32 @@ if [[ "$HAS_MAX_MEMORY_ARG" -eq 0 ]]; then
     if [[ -n "${HPROF_MAX_MEMORY_GB:-}" ]]; then
       EXTRA_ARGS+=(--max-memory-gb "${HPROF_MAX_MEMORY_GB}")
     fi
+  fi
+fi
+
+if [[ "$HAS_WORKERS_ARG" -eq 0 ]]; then
+  if printf '%s\n' "$CLI_HELP" | grep -q -- "--workers"; then
+    if [[ -n "${HPROF_WORKERS:-}" ]]; then
+      EXTRA_ARGS+=(--workers "${HPROF_WORKERS}")
+    fi
+  fi
+fi
+
+if [[ "$HAS_WORK_DIR_ARG" -eq 0 ]]; then
+  if printf '%s\n' "$CLI_HELP" | grep -q -- "--work-dir"; then
+    EXTRA_ARGS+=(--work-dir "$HPCACHE_TMP")
+  fi
+fi
+
+if [[ "$HAS_CACHE_DIR_ARG" -eq 0 ]]; then
+  if printf '%s\n' "$CLI_HELP" | grep -q -- "--cache-dir"; then
+    EXTRA_ARGS+=(--cache-dir "$HPCACHE_RESULTS")
+  fi
+fi
+
+if [[ "$HAS_CACHE_ARG" -eq 0 ]]; then
+  if printf '%s\n' "$CLI_HELP" | grep -q -- "--cache"; then
+    EXTRA_ARGS+=(--cache)
   fi
 fi
 

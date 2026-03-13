@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from array import array
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import heapq
+import math
 from pathlib import Path
 import sys
 import time
@@ -47,6 +50,7 @@ class RetainerChainNode:
 
 
 ProgressCallback = Callable[[str], None]
+SUMMARY_PARALLEL_MIN = 200_000
 
 
 class _Adjacency(Protocol):
@@ -73,6 +77,7 @@ def analyze_snapshot(
     include_dominator: bool = True,
     engine: str = "ram",
     work_dir: str | Path | None = None,
+    workers: int = 1,
     max_memory_gb: int | None = None,
     progress: ProgressCallback | None = None,
 ) -> AnalysisResult:
@@ -86,6 +91,7 @@ def analyze_snapshot(
         need_edges=include_dominator,
         engine=engine,
         work_dir=work_dir,
+        workers=workers,
         max_memory_gb=max_memory_gb,
         progress=progress,
     )
@@ -98,7 +104,7 @@ def analyze_snapshot(
         total_shallow = sum(obj.shallow_size for obj in objects.values())
         if progress is not None:
             progress("Analysis: summarizing top classes by shallow size")
-        class_summaries = _summarize_by_type(snapshot, reachable, top_n=top_n)
+        class_summaries = _summarize_by_type(snapshot, reachable, top_n=top_n, workers=workers, progress=progress)
 
         if include_dominator and dense.succ is not None and dense.pred is not None:
             if progress is not None:
@@ -137,6 +143,7 @@ def _build_dense_reachability(
     need_edges: bool,
     engine: str,
     work_dir: str | Path | None = None,
+    workers: int = 1,
     max_memory_gb: int | None = None,
     progress: ProgressCallback | None = None,
 ) -> _DenseReachability:
@@ -197,6 +204,7 @@ def _build_dense_reachability(
                 node_index,
                 root_idx,
                 work_dir=work_dir,
+                workers=workers,
                 progress=progress,
             )
         except MemoryError:
@@ -288,17 +296,40 @@ def _build_dense_reachability(
     )
 
 
-def _summarize_by_type(snapshot: HeapSnapshot, reachable: Iterable[int], *, top_n: int) -> list[ClassSummary]:
-    objects = snapshot.objects
-    counts: dict[str, int] = {}
-    sizes: dict[str, int] = {}
-    type_name_cache: dict[tuple[str, int | None, str | None], str] = {}
+def _summarize_by_type(
+    snapshot: HeapSnapshot,
+    reachable: Iterable[int],
+    *,
+    top_n: int,
+    workers: int,
+    progress: ProgressCallback | None = None,
+) -> list[ClassSummary]:
+    reachable_ids = reachable if isinstance(reachable, list) else list(reachable)
+    if workers <= 1 or len(reachable_ids) < SUMMARY_PARALLEL_MIN:
+        counts, sizes = _summarize_type_chunk(snapshot, reachable_ids)
+    else:
+        max_workers = max(1, int(workers))
+        chunk_size = max(100_000, math.ceil(len(reachable_ids) / max_workers))
+        ranges: list[tuple[int, int]] = []
+        start = 0
+        while start < len(reachable_ids):
+            end = min(len(reachable_ids), start + chunk_size)
+            ranges.append((start, end))
+            start = end
 
-    for obj_id in reachable:
-        obj = objects[obj_id]
-        type_name = _cached_object_type_name(snapshot, obj, type_name_cache)
-        counts[type_name] = counts.get(type_name, 0) + 1
-        sizes[type_name] = sizes.get(type_name, 0) + obj.shallow_size
+        if progress is not None:
+            progress(f"Analysis: class summary using {max_workers} workers")
+
+        counts = {}
+        sizes = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_summarize_type_chunk, snapshot, reachable_ids[start:end]) for start, end in ranges]
+            for fut in futures:
+                chunk_counts, chunk_sizes = fut.result()
+                for type_name, count in chunk_counts.items():
+                    counts[type_name] = counts.get(type_name, 0) + count
+                for type_name, shallow in chunk_sizes.items():
+                    sizes[type_name] = sizes.get(type_name, 0) + shallow
 
     summaries = [
         ClassSummary(type_name=type_name, object_count=counts[type_name], shallow_size=shallow)
@@ -306,6 +337,24 @@ def _summarize_by_type(snapshot: HeapSnapshot, reachable: Iterable[int], *, top_
     ]
     summaries.sort(key=lambda it: it.shallow_size, reverse=True)
     return summaries[:top_n]
+
+
+def _summarize_type_chunk(
+    snapshot: HeapSnapshot,
+    reachable_ids: Sequence[int],
+) -> tuple[dict[str, int], dict[str, int]]:
+    objects = snapshot.objects
+    counts: dict[str, int] = {}
+    sizes: dict[str, int] = {}
+    type_name_cache: dict[tuple[str, int | None, str | None], str] = {}
+
+    for obj_id in reachable_ids:
+        obj = objects[obj_id]
+        type_name = _cached_object_type_name(snapshot, obj, type_name_cache)
+        counts[type_name] = counts.get(type_name, 0) + 1
+        sizes[type_name] = sizes.get(type_name, 0) + obj.shallow_size
+
+    return counts, sizes
 
 
 def _allocate_adjacency_lists(size: int) -> tuple[list[list[int]], list[list[int]]]:
@@ -345,24 +394,26 @@ def _compute_top_retainers(
         return []
 
     shallow = dense.shallow + [0]
-    idom = _compute_idom_iterative(succ, pred, root_idx, progress=progress)
-    if idom is None:
+    idom_result = _compute_idom_lengauer_tarjan(succ, pred, root_idx, progress=progress)
+    if idom_result is None:
         return []
+    idom, dfs_order = idom_result
 
-    children: list[list[int]] = [[] for _ in range(n + 1)]
-    for node in range(n):
-        parent = idom[node]
-        if parent != -1 and parent != node:
-            children[parent].append(node)
-
+    retained = shallow[:]
     if progress is not None:
         progress("Dominator: accumulating retained sizes")
-    retained = [0] * (n + 1)
-    for node in _tree_postorder(children, root_idx):
-        total = shallow[node]
-        for child in children[node]:
-            total += retained[child]
-        retained[node] = total
+    last_report = time.perf_counter()
+    processed = 0
+    for node in reversed(dfs_order[1:]):  # Exclude synthetic root from the child-to-parent roll-up loop.
+        parent = idom[node]
+        if parent != -1 and parent != node:
+            retained[parent] += retained[node]
+        processed += 1
+        if progress is not None and processed % 500_000 == 0:
+            now = time.perf_counter()
+            if (now - last_report) >= 1.5:
+                progress(f"Dominator: retained accumulation {processed:,}/{len(dfs_order) - 1:,}")
+                last_report = now
 
     top_indexes = heapq.nlargest(min(top_n, n), range(n), key=retained.__getitem__)
     type_name_cache: dict[tuple[str, int | None, str | None], str] = {}
@@ -406,110 +457,136 @@ def _compute_top_retainers(
     return out
 
 
-def _compute_idom_iterative(
+def _compute_idom_lengauer_tarjan(
     succ: _Adjacency,
     pred: _Adjacency,
     root_idx: int,
     *,
     progress: ProgressCallback | None = None,
-) -> list[int] | None:
+) -> tuple[Sequence[int], list[int]] | None:
     node_count = len(succ)
-    rpo = _reverse_postorder(succ, root_idx)
-    if len(rpo) <= 1:
-        idom = [-1] * node_count
-        idom[root_idx] = root_idx
-        return idom
 
-    rpo_pos = [0] * node_count
-    for i, node in enumerate(rpo):
-        rpo_pos[node] = i
+    parent = array("i", [-1]) * node_count
+    ancestor = array("i", [-1]) * node_count
+    label = array("i", [-1]) * node_count
+    idom = array("i", [-1]) * node_count
+    dfsnum = array("I", [0]) * node_count
+    semi = array("I", [0]) * node_count
 
-    idom = [-1] * node_count
-    idom[root_idx] = root_idx
+    # vertex[dfs_index] -> node index. Index 0 is unused to keep DFS numbers 1-based.
+    vertex = array("i", [0])
+    dfs_index = 0
 
-    if progress is not None:
-        progress(f"Dominator: traversal order built ({len(rpo) - 1:,} nodes)")
-
-    changed = True
-    iteration = 0
-    last_report = time.perf_counter()
-    while changed:
-        iteration += 1
-        changed = False
-        processed = 0
-        for node in rpo[1:]:
-            new_idom = -1
-            for p in pred[node]:
-                pred_idx = int(p)
-                if idom[pred_idx] == -1:
-                    continue
-                if new_idom == -1:
-                    new_idom = pred_idx
-                else:
-                    new_idom = _intersect(pred_idx, new_idom, idom, rpo_pos)
-
-            if new_idom != -1 and idom[node] != new_idom:
-                idom[node] = new_idom
-                changed = True
-
-            processed += 1
-            if progress is not None and processed % 500_000 == 0:
-                now = time.perf_counter()
-                if (now - last_report) >= 1.5:
-                    progress(f"Dominator: iteration {iteration} processed {processed:,}/{len(rpo) - 1:,}")
-                    last_report = now
-
-        if progress is not None:
-            progress(f"Dominator: iteration {iteration} complete ({'changed' if changed else 'stable'})")
-
-    return idom
-
-
-def _reverse_postorder(succ: _Adjacency, root_idx: int) -> list[int]:
-    visited = [False] * len(succ)
-    postorder: list[int] = []
     stack: list[tuple[int, int]] = [(root_idx, 0)]
-    visited[root_idx] = True
+    dfs_index += 1
+    dfsnum[root_idx] = dfs_index
+    semi[root_idx] = dfs_index
+    label[root_idx] = root_idx
+    vertex.append(root_idx)
 
+    last_report = time.perf_counter()
     while stack:
         node, edge_pos = stack[-1]
         row = succ[node]
         if edge_pos < len(row):
             nxt = int(row[edge_pos])
             stack[-1] = (node, edge_pos + 1)
-            if not visited[nxt]:
-                visited[nxt] = True
-                stack.append((nxt, 0))
+            if dfsnum[nxt] != 0:
+                continue
+            parent[nxt] = node
+            dfs_index += 1
+            dfsnum[nxt] = dfs_index
+            semi[nxt] = dfs_index
+            label[nxt] = nxt
+            vertex.append(nxt)
+            stack.append((nxt, 0))
+            if progress is not None and dfs_index % 500_000 == 0:
+                now = time.perf_counter()
+                if (now - last_report) >= 1.5:
+                    progress(f"Dominator: DFS discovered {dfs_index - 1:,} nodes")
+                    last_report = now
             continue
-        postorder.append(node)
         stack.pop()
 
-    postorder.reverse()
-    return postorder
+    if dfs_index == 0:
+        return None
 
+    if progress is not None:
+        progress(f"Dominator: DFS order built ({dfs_index - 1:,} nodes)")
 
-def _intersect(a: int, b: int, idom: list[int], rpo_pos: list[int]) -> int:
-    while a != b:
-        while rpo_pos[a] > rpo_pos[b]:
-            a = idom[a]
-        while rpo_pos[b] > rpo_pos[a]:
-            b = idom[b]
-    return a
+    def lt_link(v: int, w: int) -> None:
+        ancestor[w] = v
 
+    def lt_compress(v: int) -> None:
+        av = ancestor[v]
+        if av == -1:
+            return
+        aav = ancestor[av]
+        if aav != -1:
+            lt_compress(av)
+            lav = label[av]
+            if semi[lav] < semi[label[v]]:
+                label[v] = lav
+            ancestor[v] = ancestor[av]
 
-def _tree_postorder(children: list[list[int]], root_idx: int) -> list[int]:
-    postorder: list[int] = []
-    stack: list[tuple[int, int]] = [(root_idx, 0)]
-    while stack:
-        node, child_pos = stack[-1]
-        if child_pos < len(children[node]):
-            child = children[node][child_pos]
-            stack[-1] = (node, child_pos + 1)
-            stack.append((child, 0))
+    def lt_eval(v: int) -> int:
+        if ancestor[v] == -1:
+            return label[v]
+        lt_compress(v)
+        return label[v]
+
+    buckets: dict[int, list[int]] = {}
+    last_report = time.perf_counter()
+    processed = 0
+    for idx in range(dfs_index, 1, -1):
+        w = vertex[idx]
+        sw = semi[w]
+        for pred_node_raw in pred[w]:
+            pred_node = int(pred_node_raw)
+            if dfsnum[pred_node] == 0:
+                continue
+            u = lt_eval(pred_node)
+            if semi[u] < sw:
+                sw = semi[u]
+        semi[w] = sw
+
+        semidom_node = vertex[sw]
+        bucket = buckets.get(semidom_node)
+        if bucket is None:
+            buckets[semidom_node] = [w]
+        else:
+            bucket.append(w)
+
+        pw = parent[w]
+        lt_link(pw, w)
+
+        pw_bucket = buckets.pop(pw, None)
+        if pw_bucket is not None:
+            for v in pw_bucket:
+                u = lt_eval(v)
+                if semi[u] < semi[v]:
+                    idom[v] = u
+                else:
+                    idom[v] = pw
+
+        processed += 1
+        if progress is not None and processed % 500_000 == 0:
+            now = time.perf_counter()
+            if (now - last_report) >= 1.5:
+                progress(f"Dominator: semidominators processed {processed:,}/{dfs_index - 1:,}")
+                last_report = now
+
+    idom[root_idx] = root_idx
+    for idx in range(2, dfs_index + 1):
+        w = vertex[idx]
+        sw_node = vertex[semi[w]]
+        iw = idom[w]
+        if iw == -1:
             continue
-        postorder.append(node)
-        stack.pop()
-    return postorder
+        if iw != sw_node:
+            idom[w] = idom[iw]
+
+    return idom, [int(node) for node in vertex[1 : dfs_index + 1]]
 
 
 def _cached_object_type_name(
@@ -529,7 +606,7 @@ def _cached_object_type_name(
 def _build_retainer_chain(
     *,
     idx: int,
-    idom: list[int],
+    idom: Sequence[int],
     node_ids: list[int],
     root_idx: int,
     objects: dict[int, ObjectRecord],

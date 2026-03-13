@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import io
 import struct
@@ -7,7 +8,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 
 from hprof_report.analyzer import analyze_snapshot
 from hprof_report import cli
@@ -241,9 +242,9 @@ class MinimalHprofTests(unittest.TestCase):
         snapshot.objects[0xB].refs.append(0xC)
         snapshot.objects[0xC].refs.append(0xD)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            ram_result = analyze_snapshot(snapshot, top_n=10, engine="ram")
-            disk_result = analyze_snapshot(snapshot, top_n=10, engine="disk", work_dir=tmp)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("hprof_report.disk_graph.CSR_PARALLEL_MIN", 1):
+            ram_result = analyze_snapshot(snapshot, top_n=10, engine="ram", workers=1)
+            disk_result = analyze_snapshot(snapshot, top_n=10, engine="disk", work_dir=tmp, workers=2)
 
         self.assertEqual(disk_result.reachable_count, ram_result.reachable_count)
         self.assertEqual(disk_result.non_collectable_size, ram_result.non_collectable_size)
@@ -255,6 +256,50 @@ class MinimalHprofTests(unittest.TestCase):
             {row.object_id: row.retained_size for row in disk_result.top_retainers},
             {row.object_id: row.retained_size for row in ram_result.top_retainers},
         )
+
+    def test_class_summary_parallel_matches_serial(self) -> None:
+        snapshot = HeapSnapshot(id_size=4, version="test")
+        for idx in range(1, 201):
+            class_id = 0x100 if idx % 2 == 0 else 0x101
+            snapshot.ensure_object(idx, kind="instance", class_id=class_id, shallow_size=4)
+            if idx < 200:
+                snapshot.objects[idx].refs.append(idx + 1)
+        snapshot.roots.add(1)
+
+        with mock.patch("hprof_report.analyzer.SUMMARY_PARALLEL_MIN", 1):
+            serial = analyze_snapshot(snapshot, include_dominator=False, workers=1, top_n=10)
+            parallel = analyze_snapshot(snapshot, include_dominator=False, workers=4, top_n=10)
+
+        self.assertEqual(
+            [(row.type_name, row.object_count, row.shallow_size) for row in parallel.class_summaries],
+            [(row.type_name, row.object_count, row.shallow_size) for row in serial.class_summaries],
+        )
+        self.assertEqual(parallel.non_collectable_size, serial.non_collectable_size)
+
+    def test_parser_parallel_pending_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            hprof = Path(tmp) / "pending_parallel.hprof"
+            header = b"JAVA PROFILE 1.0.2\x00" + _u4(4) + _u8(0)
+            records = [
+                _string_record(1, "com/example/Node"),
+                _string_record(2, "next"),
+                _load_class_record(0x100, 1),
+            ]
+            # Instance appears before class dump metadata in the same heap segment.
+            heap = (
+                _root_unknown(0x200)
+                + _instance_dump(0x200, 0x100, 0x300)
+                + _instance_dump(0x300, 0x100, 0)
+                + _class_dump(0x100, 2)
+            )
+            records.append(_record(0x0C, heap))
+            hprof.write_bytes(header + b"".join(records))
+
+            with mock.patch("hprof_report.parser.PARSER_PARALLEL_PENDING_MIN", 1):
+                snapshot = HprofParser(workers=2).parse(hprof)
+
+            self.assertIn(0x200, snapshot.objects)
+            self.assertIn(0x300, snapshot.objects[0x200].refs)
 
     def test_dominator_fallback_on_edge_index_memory_error(self) -> None:
         snapshot = HeapSnapshot(id_size=4, version="test")
@@ -304,7 +349,43 @@ class MinimalHprofTests(unittest.TestCase):
         args = parser.parse_args(["/tmp/heap.hprof"])
         self.assertEqual(args.max_memory_gb, 6)
         self.assertEqual(args.engine, "ram")
+        self.assertEqual(args.workers, max(1, (os.cpu_count() or 1)))
+        self.assertTrue(args.cache)
+        self.assertEqual(args.cache_dir, ".hprof-cache/results")
         self.assertIsNone(args.work_dir)
+
+    def test_cli_cache_hit_skips_parse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            hprof = Path(tmp) / "sample.hprof"
+            _build_test_hprof(hprof)
+            cache_dir = Path(tmp) / "cache"
+            output = io.StringIO()
+
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["hprof-report", str(hprof), "--cache-dir", str(cache_dir), "--format", "json"],
+                ),
+                redirect_stdout(output),
+            ):
+                code_first = cli.main()
+            self.assertEqual(code_first, 0)
+            self.assertTrue(any(path.name.endswith(".json") for path in cache_dir.rglob("*.json")))
+
+            output_second = io.StringIO()
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["hprof-report", str(hprof), "--cache-dir", str(cache_dir), "--format", "json"],
+                ),
+                mock.patch.object(cli.HprofParser, "parse", side_effect=AssertionError("parse should not be called")),
+                redirect_stdout(output_second),
+            ):
+                code_second = cli.main()
+            self.assertEqual(code_second, 0)
+            self.assertTrue(output_second.getvalue())
 
     def test_cli_ctrl_c_is_clean(self) -> None:
         stderr = io.StringIO()

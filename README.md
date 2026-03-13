@@ -27,6 +27,9 @@ Use the wrapper script to run analysis. It bootstraps local `.venv`, installs re
 ```
 
 `run_hprof_report.sh` defaults to `--engine disk` (override with `--engine ram` or `HPROF_ENGINE=ram`).
+By default, the script places cache and disk-engine temp files under `./.hprof-cache/`:
+- results cache: `./.hprof-cache/results`
+- disk temp/work files: `./.hprof-cache/tmp`
 
 Optional flags:
 
@@ -34,8 +37,11 @@ Optional flags:
 ./run_hprof_report.sh /path/to/heapdump.hprof --top 30
 ./run_hprof_report.sh /path/to/heapdump.hprof --format json
 ./run_hprof_report.sh /path/to/heapdump.hprof --engine disk --work-dir /tmp/hprof-work
+./run_hprof_report.sh /path/to/heapdump.hprof --workers 8
 ./run_hprof_report.sh /path/to/heapdump.hprof --no-dominator
 ./run_hprof_report.sh /path/to/heapdump.hprof --include-unreachable-roots
+./run_hprof_report.sh /path/to/heapdump.hprof --cache-dir ./.hprof-cache/results
+./run_hprof_report.sh /path/to/heapdump.hprof --no-cache
 ./run_hprof_report.sh /path/to/heapdump.hprof --max-memory-gb 24
 ./run_hprof_report.sh /path/to/heapdump.hprof --verbose
 ```
@@ -77,6 +83,9 @@ Top object retainers (approximate retained size):
 - Dominator retained sizes are approximate and can be expensive on very large dumps; use `--no-dominator` for faster class-only output.
 - `--engine disk` stores dominator adjacency in memory-mapped CSR temp files instead of Python list-of-lists.
 - `--work-dir` controls where `--engine disk` temp files are created.
+- `--workers` controls parallel parser/analysis phases (class summary, deferred-instance resolution, and disk successor materialization).
+- `--cache` / `--no-cache` controls result caching keyed by heap file hash + analysis options.
+- `--cache-dir` controls where cached analysis results are stored.
 - `--max-memory-gb` sets a soft budget for dominator edge indexing (defaults to 60% of detected system RAM).
 - If dominator edge indexing runs out of memory, analysis now falls back to class-only output instead of aborting.
 - For very large dumps, use `--verbose` to monitor parser/analysis progress and timings.
