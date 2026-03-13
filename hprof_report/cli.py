@@ -145,7 +145,7 @@ def _build_parser() -> argparse.ArgumentParser:
     else:
         memory_help = (
             "Soft memory budget in GiB for dominator edge indexing "
-            f"(default: {default_max_memory_gb}, 60%% of detected RAM)."
+            f"(default: {default_max_memory_gb}, 45%% of detected RAM)."
         )
     p.add_argument(
         "--max-memory-gb",
@@ -160,7 +160,7 @@ def _default_max_memory_gb() -> int | None:
     total_bytes = _detect_total_memory_bytes()
     if total_bytes is None or total_bytes <= 0:
         return None
-    gb = int((total_bytes * 0.60) / (1024**3))
+    gb = int((total_bytes * 0.45) / (1024**3))
     return max(1, gb)
 
 

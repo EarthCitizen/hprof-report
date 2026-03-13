@@ -343,11 +343,11 @@ class MinimalHprofTests(unittest.TestCase):
         self.assertEqual(result.top_retainers, [])
         self.assertTrue(any("exceeds --max-memory-gb=1" in msg for msg in messages))
 
-    def test_cli_default_max_memory_is_60_percent_of_detected_ram(self) -> None:
+    def test_cli_default_max_memory_is_45_percent_of_detected_ram(self) -> None:
         with mock.patch("hprof_report.cli._detect_total_memory_bytes", return_value=10 * (1024**3)):
             parser = cli._build_parser()
         args = parser.parse_args(["/tmp/heap.hprof"])
-        self.assertEqual(args.max_memory_gb, 6)
+        self.assertEqual(args.max_memory_gb, 4)
         self.assertEqual(args.engine, "ram")
         self.assertEqual(args.workers, max(1, (os.cpu_count() or 1)))
         self.assertTrue(args.cache)

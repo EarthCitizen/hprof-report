@@ -89,9 +89,7 @@ fi
 
 if [[ "$HAS_WORKERS_ARG" -eq 0 ]]; then
   if printf '%s\n' "$CLI_HELP" | grep -q -- "--workers"; then
-    if [[ -n "${HPROF_WORKERS:-}" ]]; then
-      EXTRA_ARGS+=(--workers "${HPROF_WORKERS}")
-    fi
+    EXTRA_ARGS+=(--workers "${HPROF_WORKERS:-4}")
   fi
 fi
 

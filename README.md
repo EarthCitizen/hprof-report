@@ -26,7 +26,7 @@ Use the wrapper script to run analysis. It bootstraps local `.venv`, installs re
 ./run_hprof_report.sh /path/to/heapdump.hprof
 ```
 
-`run_hprof_report.sh` defaults to `--engine disk` (override with `--engine ram` or `HPROF_ENGINE=ram`).
+`run_hprof_report.sh` defaults to `--engine disk` and `--workers 4` (override with CLI flags, `HPROF_ENGINE`, or `HPROF_WORKERS`).
 By default, the script places cache and disk-engine temp files under `./.hprof-cache/`:
 - results cache: `./.hprof-cache/results`
 - disk temp/work files: `./.hprof-cache/tmp`
@@ -86,7 +86,7 @@ Top object retainers (approximate retained size):
 - `--workers` controls parallel parser/analysis phases (class summary, deferred-instance resolution, and disk successor materialization).
 - `--cache` / `--no-cache` controls result caching keyed by heap file hash + analysis options.
 - `--cache-dir` controls where cached analysis results are stored.
-- `--max-memory-gb` sets a soft budget for dominator edge indexing (defaults to 60% of detected system RAM).
+- `--max-memory-gb` sets a soft budget for dominator edge indexing (defaults to 45% of detected system RAM).
 - If dominator edge indexing runs out of memory, analysis now falls back to class-only output instead of aborting.
 - For very large dumps, use `--verbose` to monitor parser/analysis progress and timings.
 - Parser supports standard HPROF records used by HotSpot/OpenJDK heap dumps (`STRING`, `LOAD_CLASS`, `HEAP_DUMP`, `HEAP_DUMP_SEGMENT` and core heap sub-records).
