@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import heapq
+from pathlib import Path
+import sys
 import time
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Protocol, Sequence
 
 from .model import HeapSnapshot, ObjectRecord
 
@@ -47,14 +49,21 @@ class RetainerChainNode:
 ProgressCallback = Callable[[str], None]
 
 
+class _Adjacency(Protocol):
+    def __len__(self) -> int: ...
+
+    def __getitem__(self, idx: int) -> Sequence[int]: ...
+
+
 @dataclass(slots=True)
 class _DenseReachability:
     node_ids: list[int]
     shallow: list[int]
     reachable_shallow: int
-    succ: list[list[int]] | None
-    pred: list[list[int]] | None
+    succ: _Adjacency | None
+    pred: _Adjacency | None
     root_idx: int
+    cleanup: Callable[[], None] | None
 
 
 def analyze_snapshot(
@@ -62,6 +71,9 @@ def analyze_snapshot(
     *,
     top_n: int = 20,
     include_dominator: bool = True,
+    engine: str = "ram",
+    work_dir: str | Path | None = None,
+    max_memory_gb: int | None = None,
     progress: ProgressCallback | None = None,
 ) -> AnalysisResult:
     started_at = time.perf_counter()
@@ -69,45 +81,63 @@ def analyze_snapshot(
 
     if progress is not None:
         progress("Analysis: computing dense reachable graph from GC roots")
-    dense = _build_dense_reachability(snapshot, need_edges=include_dominator, progress=progress)
-    reachable = dense.node_ids
-    reachable_shallow = dense.reachable_shallow
-    if progress is not None:
-        progress(f"Analysis: reachability complete ({len(reachable):,} reachable objects)")
-
-    total_shallow = sum(obj.shallow_size for obj in objects.values())
-    if progress is not None:
-        progress("Analysis: summarizing top classes by shallow size")
-    class_summaries = _summarize_by_type(snapshot, reachable, top_n=top_n)
-
-    if include_dominator:
-        if progress is not None:
-            progress("Analysis: computing retained sizes via dominator tree")
-        top_retainers = _compute_top_retainers(snapshot, dense, top_n=top_n, progress=progress)
-    else:
-        top_retainers = []
-        if progress is not None:
-            progress("Analysis: skipping dominator tree (--no-dominator)")
-
-    if progress is not None:
-        elapsed = time.perf_counter() - started_at
-        progress(f"Analysis: complete in {elapsed:.2f}s")
-
-    return AnalysisResult(
-        object_count=len(objects),
-        root_count=len(snapshot.roots),
-        total_shallow_size=total_shallow,
-        reachable_count=len(reachable),
-        non_collectable_size=reachable_shallow,
-        class_summaries=class_summaries,
-        top_retainers=top_retainers,
+    dense = _build_dense_reachability(
+        snapshot,
+        need_edges=include_dominator,
+        engine=engine,
+        work_dir=work_dir,
+        max_memory_gb=max_memory_gb,
+        progress=progress,
     )
+    try:
+        reachable = dense.node_ids
+        reachable_shallow = dense.reachable_shallow
+        if progress is not None:
+            progress(f"Analysis: reachability complete ({len(reachable):,} reachable objects)")
+
+        total_shallow = sum(obj.shallow_size for obj in objects.values())
+        if progress is not None:
+            progress("Analysis: summarizing top classes by shallow size")
+        class_summaries = _summarize_by_type(snapshot, reachable, top_n=top_n)
+
+        if include_dominator and dense.succ is not None and dense.pred is not None:
+            if progress is not None:
+                progress("Analysis: computing retained sizes via dominator tree")
+            top_retainers = _compute_top_retainers(snapshot, dense, top_n=top_n, progress=progress)
+        elif include_dominator:
+            top_retainers = []
+            if progress is not None:
+                progress("Analysis: skipping dominator tree (insufficient memory for edge index)")
+        else:
+            top_retainers = []
+            if progress is not None:
+                progress("Analysis: skipping dominator tree (--no-dominator)")
+
+        if progress is not None:
+            elapsed = time.perf_counter() - started_at
+            progress(f"Analysis: complete in {elapsed:.2f}s")
+
+        return AnalysisResult(
+            object_count=len(objects),
+            root_count=len(snapshot.roots),
+            total_shallow_size=total_shallow,
+            reachable_count=len(reachable),
+            non_collectable_size=reachable_shallow,
+            class_summaries=class_summaries,
+            top_retainers=top_retainers,
+        )
+    finally:
+        if dense.cleanup is not None:
+            dense.cleanup()
 
 
 def _build_dense_reachability(
     snapshot: HeapSnapshot,
     *,
     need_edges: bool,
+    engine: str,
+    work_dir: str | Path | None = None,
+    max_memory_gb: int | None = None,
     progress: ProgressCallback | None = None,
 ) -> _DenseReachability:
     objects = snapshot.objects
@@ -154,28 +184,98 @@ def _build_dense_reachability(
             succ=None,
             pred=None,
             root_idx=root_idx,
+            cleanup=None,
         )
 
-    succ: list[list[int]] = [[] for _ in range(n + 1)]
-    pred: list[list[int]] = [[] for _ in range(n + 1)]
-    node_index_get = node_index.get
-    for idx, obj_id in enumerate(node_ids):
-        obj = objects_get(obj_id)
-        row = succ[idx]
-        row_append = row.append
-        for ref_id in obj.refs:
-            target = node_index_get(ref_id)
-            if target is not None:
-                row_append(target)
-                pred[target].append(idx)
+    if engine == "disk":
+        from .disk_graph import build_disk_adjacency
 
-    root_row = succ[root_idx]
-    root_row_append = root_row.append
-    for root_obj_id in snapshot.roots:
-        idx = node_index_get(root_obj_id)
-        if idx is not None:
-            root_row_append(idx)
-            pred[idx].append(root_idx)
+        try:
+            store = build_disk_adjacency(
+                snapshot,
+                node_ids,
+                node_index,
+                root_idx,
+                work_dir=work_dir,
+                progress=progress,
+            )
+        except MemoryError:
+            if progress is not None:
+                progress("Analysis: out of memory building disk-backed edge index; continuing without dominator")
+            return _DenseReachability(
+                node_ids=node_ids,
+                shallow=shallow,
+                reachable_shallow=reachable_shallow,
+                succ=None,
+                pred=None,
+                root_idx=root_idx,
+                cleanup=None,
+            )
+        return _DenseReachability(
+            node_ids=node_ids,
+            shallow=shallow,
+            reachable_shallow=reachable_shallow,
+            succ=store.succ,
+            pred=store.pred,
+            root_idx=root_idx,
+            cleanup=store.close,
+        )
+
+    if engine != "ram":
+        raise ValueError(f"Unsupported engine: {engine}")
+
+    if max_memory_gb is not None and max_memory_gb > 0:
+        budget_bytes = max_memory_gb * (1024**3)
+        baseline_bytes = _estimate_dense_edge_index_baseline_bytes(n + 1)
+        if baseline_bytes > budget_bytes:
+            if progress is not None:
+                progress(
+                    "Analysis: skipping dominator tree "
+                    f"(edge index baseline {baseline_bytes / (1024**3):.2f} GiB "
+                    f"exceeds --max-memory-gb={max_memory_gb})"
+                )
+            return _DenseReachability(
+                node_ids=node_ids,
+                shallow=shallow,
+                reachable_shallow=reachable_shallow,
+                succ=None,
+                pred=None,
+                root_idx=root_idx,
+                cleanup=None,
+            )
+
+    try:
+        succ, pred = _allocate_adjacency_lists(n + 1)
+        node_index_get = node_index.get
+        for idx, obj_id in enumerate(node_ids):
+            obj = objects_get(obj_id)
+            row = succ[idx]
+            row_append = row.append
+            for ref_id in obj.refs:
+                target = node_index_get(ref_id)
+                if target is not None:
+                    row_append(target)
+                    pred[target].append(idx)
+
+        root_row = succ[root_idx]
+        root_row_append = root_row.append
+        for root_obj_id in snapshot.roots:
+            idx = node_index_get(root_obj_id)
+            if idx is not None:
+                root_row_append(idx)
+                pred[idx].append(root_idx)
+    except MemoryError:
+        if progress is not None:
+            progress("Analysis: out of memory building dominator edge index; continuing without dominator")
+        return _DenseReachability(
+            node_ids=node_ids,
+            shallow=shallow,
+            reachable_shallow=reachable_shallow,
+            succ=None,
+            pred=None,
+            root_idx=root_idx,
+            cleanup=None,
+        )
 
     return _DenseReachability(
         node_ids=node_ids,
@@ -184,6 +284,7 @@ def _build_dense_reachability(
         succ=succ,
         pred=pred,
         root_idx=root_idx,
+        cleanup=None,
     )
 
 
@@ -205,6 +306,23 @@ def _summarize_by_type(snapshot: HeapSnapshot, reachable: Iterable[int], *, top_
     ]
     summaries.sort(key=lambda it: it.shallow_size, reverse=True)
     return summaries[:top_n]
+
+
+def _allocate_adjacency_lists(size: int) -> tuple[list[list[int]], list[list[int]]]:
+    return ([[] for _ in range(size)], [[] for _ in range(size)])
+
+
+def _estimate_dense_edge_index_baseline_bytes(size: int) -> int:
+    empty_list = sys.getsizeof([])
+    one_item_list = sys.getsizeof([0])
+    ptr_size = max(0, one_item_list - empty_list)
+
+    # Approximate lower bound for two list-of-lists structures:
+    # - outer list storage (list headers + element pointer arrays)
+    # - per-node empty row list headers
+    outer_lists = 2 * (empty_list + (size * ptr_size))
+    per_row_lists = 2 * size * empty_list
+    return outer_lists + per_row_lists
 
 
 def _compute_top_retainers(
@@ -289,8 +407,8 @@ def _compute_top_retainers(
 
 
 def _compute_idom_iterative(
-    succ: list[list[int]],
-    pred: list[list[int]],
+    succ: _Adjacency,
+    pred: _Adjacency,
     root_idx: int,
     *,
     progress: ProgressCallback | None = None,
@@ -322,12 +440,13 @@ def _compute_idom_iterative(
         for node in rpo[1:]:
             new_idom = -1
             for p in pred[node]:
-                if idom[p] == -1:
+                pred_idx = int(p)
+                if idom[pred_idx] == -1:
                     continue
                 if new_idom == -1:
-                    new_idom = p
+                    new_idom = pred_idx
                 else:
-                    new_idom = _intersect(p, new_idom, idom, rpo_pos)
+                    new_idom = _intersect(pred_idx, new_idom, idom, rpo_pos)
 
             if new_idom != -1 and idom[node] != new_idom:
                 idom[node] = new_idom
@@ -346,7 +465,7 @@ def _compute_idom_iterative(
     return idom
 
 
-def _reverse_postorder(succ: list[list[int]], root_idx: int) -> list[int]:
+def _reverse_postorder(succ: _Adjacency, root_idx: int) -> list[int]:
     visited = [False] * len(succ)
     postorder: list[int] = []
     stack: list[tuple[int, int]] = [(root_idx, 0)]
@@ -356,7 +475,7 @@ def _reverse_postorder(succ: list[list[int]], root_idx: int) -> list[int]:
         node, edge_pos = stack[-1]
         row = succ[node]
         if edge_pos < len(row):
-            nxt = row[edge_pos]
+            nxt = int(row[edge_pos])
             stack[-1] = (node, edge_pos + 1)
             if not visited[nxt]:
                 visited[nxt] = True

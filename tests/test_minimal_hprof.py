@@ -227,6 +227,85 @@ class MinimalHprofTests(unittest.TestCase):
         self.assertEqual(rows_by_id[0xC].held_by_type_name, "GC_ROOT")
         self.assertEqual(rows_by_id[0xD].held_by_object_id, 0xC)
 
+    def test_disk_engine_matches_ram_results(self) -> None:
+        try:
+            import numpy  # noqa: F401
+        except Exception:
+            self.skipTest("numpy not installed")
+
+        snapshot = HeapSnapshot(id_size=4, version="test")
+        for obj_id in (0xA, 0xB, 0xC, 0xD):
+            snapshot.ensure_object(obj_id, kind="instance", class_id=0x100, shallow_size=4)
+        snapshot.roots.update((0xA, 0xB))
+        snapshot.objects[0xA].refs.append(0xC)
+        snapshot.objects[0xB].refs.append(0xC)
+        snapshot.objects[0xC].refs.append(0xD)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ram_result = analyze_snapshot(snapshot, top_n=10, engine="ram")
+            disk_result = analyze_snapshot(snapshot, top_n=10, engine="disk", work_dir=tmp)
+
+        self.assertEqual(disk_result.reachable_count, ram_result.reachable_count)
+        self.assertEqual(disk_result.non_collectable_size, ram_result.non_collectable_size)
+        self.assertEqual(
+            [(row.type_name, row.object_count, row.shallow_size) for row in disk_result.class_summaries],
+            [(row.type_name, row.object_count, row.shallow_size) for row in ram_result.class_summaries],
+        )
+        self.assertEqual(
+            {row.object_id: row.retained_size for row in disk_result.top_retainers},
+            {row.object_id: row.retained_size for row in ram_result.top_retainers},
+        )
+
+    def test_dominator_fallback_on_edge_index_memory_error(self) -> None:
+        snapshot = HeapSnapshot(id_size=4, version="test")
+        snapshot.ensure_object(0xA, kind="instance", class_id=0x100, shallow_size=4)
+        snapshot.ensure_object(0xB, kind="instance", class_id=0x100, shallow_size=4)
+        snapshot.roots.add(0xA)
+        snapshot.objects[0xA].refs.append(0xB)
+
+        messages: list[str] = []
+        with mock.patch("hprof_report.analyzer._allocate_adjacency_lists", side_effect=MemoryError):
+            result = analyze_snapshot(snapshot, top_n=10, include_dominator=True, progress=messages.append)
+
+        self.assertEqual(result.reachable_count, 2)
+        self.assertTrue(result.class_summaries)
+        self.assertEqual(result.top_retainers, [])
+        self.assertTrue(any("out of memory building dominator edge index" in msg for msg in messages))
+        self.assertTrue(any("skipping dominator tree (insufficient memory for edge index)" in msg for msg in messages))
+
+    def test_dominator_skips_when_memory_budget_too_small(self) -> None:
+        snapshot = HeapSnapshot(id_size=4, version="test")
+        snapshot.ensure_object(0xA, kind="instance", class_id=0x100, shallow_size=4)
+        snapshot.ensure_object(0xB, kind="instance", class_id=0x100, shallow_size=4)
+        snapshot.roots.add(0xA)
+        snapshot.objects[0xA].refs.append(0xB)
+
+        messages: list[str] = []
+        with mock.patch(
+            "hprof_report.analyzer._estimate_dense_edge_index_baseline_bytes",
+            return_value=2 * (1024**3),
+        ):
+            result = analyze_snapshot(
+                snapshot,
+                top_n=10,
+                include_dominator=True,
+                max_memory_gb=1,
+                progress=messages.append,
+            )
+
+        self.assertEqual(result.reachable_count, 2)
+        self.assertTrue(result.class_summaries)
+        self.assertEqual(result.top_retainers, [])
+        self.assertTrue(any("exceeds --max-memory-gb=1" in msg for msg in messages))
+
+    def test_cli_default_max_memory_is_60_percent_of_detected_ram(self) -> None:
+        with mock.patch("hprof_report.cli._detect_total_memory_bytes", return_value=10 * (1024**3)):
+            parser = cli._build_parser()
+        args = parser.parse_args(["/tmp/heap.hprof"])
+        self.assertEqual(args.max_memory_gb, 6)
+        self.assertEqual(args.engine, "ram")
+        self.assertIsNone(args.work_dir)
+
     def test_cli_ctrl_c_is_clean(self) -> None:
         stderr = io.StringIO()
         with (

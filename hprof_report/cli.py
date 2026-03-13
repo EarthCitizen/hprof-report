@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -23,6 +24,9 @@ def main() -> int:
             snapshot,
             top_n=args.top,
             include_dominator=not args.no_dominator,
+            engine=args.engine,
+            work_dir=args.work_dir,
+            max_memory_gb=args.max_memory_gb,
             progress=progress,
         )
         if progress is not None:
@@ -49,6 +53,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("hprof_file", help="Path to .hprof heap dump")
     p.add_argument("--top", type=int, default=20, help="How many entries to show in each ranking (default: 20)")
     p.add_argument(
+        "--engine",
+        choices=("ram", "disk"),
+        default="ram",
+        help="Graph analysis backend (default: ram). Use disk for lower-memory dominator indexing.",
+    )
+    p.add_argument(
+        "--work-dir",
+        default=None,
+        help="Directory for disk engine temporary index files (default: system temp directory).",
+    )
+    p.add_argument(
         "--format",
         choices=("text", "json"),
         default="text",
@@ -69,7 +84,50 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print phase timings and periodic progress updates to stderr.",
     )
+    default_max_memory_gb = _default_max_memory_gb()
+    if default_max_memory_gb is None:
+        memory_help = (
+            "Soft memory budget in GiB for dominator edge indexing. "
+            "If omitted, no explicit budget is applied."
+        )
+    else:
+        memory_help = (
+            "Soft memory budget in GiB for dominator edge indexing "
+            f"(default: {default_max_memory_gb}, 60%% of detected RAM)."
+        )
+    p.add_argument(
+        "--max-memory-gb",
+        type=int,
+        default=default_max_memory_gb,
+        help=memory_help,
+    )
     return p
+
+
+def _default_max_memory_gb() -> int | None:
+    total_bytes = _detect_total_memory_bytes()
+    if total_bytes is None or total_bytes <= 0:
+        return None
+    gb = int((total_bytes * 0.60) / (1024**3))
+    return max(1, gb)
+
+
+def _detect_total_memory_bytes() -> int | None:
+    try:
+        import psutil  # type: ignore
+
+        return int(psutil.virtual_memory().total)
+    except Exception:
+        pass
+
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if isinstance(pages, int) and isinstance(page_size, int) and pages > 0 and page_size > 0:
+            return pages * page_size
+    except Exception:
+        pass
+    return None
 
 
 def _print_text(result: AnalysisResult, source: Path) -> None:

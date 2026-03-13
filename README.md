@@ -20,24 +20,24 @@ pip install -e .
 
 ## Usage
 
-```bash
-hprof-report /path/to/heapdump.hprof
-```
-
-Run without installing (from repository root):
+Use the wrapper script to run analysis. It bootstraps local `.venv`, installs requirements, and executes the CLI:
 
 ```bash
-python3 -m hprof_report.cli /path/to/heapdump.hprof
+./run_hprof_report.sh /path/to/heapdump.hprof
 ```
+
+`run_hprof_report.sh` defaults to `--engine disk` (override with `--engine ram` or `HPROF_ENGINE=ram`).
 
 Optional flags:
 
 ```bash
-hprof-report /path/to/heapdump.hprof --top 30
-hprof-report /path/to/heapdump.hprof --format json
-hprof-report /path/to/heapdump.hprof --no-dominator
-hprof-report /path/to/heapdump.hprof --include-unreachable-roots
-hprof-report /path/to/heapdump.hprof --verbose
+./run_hprof_report.sh /path/to/heapdump.hprof --top 30
+./run_hprof_report.sh /path/to/heapdump.hprof --format json
+./run_hprof_report.sh /path/to/heapdump.hprof --engine disk --work-dir /tmp/hprof-work
+./run_hprof_report.sh /path/to/heapdump.hprof --no-dominator
+./run_hprof_report.sh /path/to/heapdump.hprof --include-unreachable-roots
+./run_hprof_report.sh /path/to/heapdump.hprof --max-memory-gb 24
+./run_hprof_report.sh /path/to/heapdump.hprof --verbose
 ```
 
 `--verbose` prints periodic progress and phase timing to stderr so you can tell it is still working on large dumps.
@@ -75,6 +75,10 @@ Top object retainers (approximate retained size):
   - primitive arrays: `length * primitive_size`
 - Object-header and alignment overhead are not reconstructed, so values are best for relative ranking.
 - Dominator retained sizes are approximate and can be expensive on very large dumps; use `--no-dominator` for faster class-only output.
+- `--engine disk` stores dominator adjacency in memory-mapped CSR temp files instead of Python list-of-lists.
+- `--work-dir` controls where `--engine disk` temp files are created.
+- `--max-memory-gb` sets a soft budget for dominator edge indexing (defaults to 60% of detected system RAM).
+- If dominator edge indexing runs out of memory, analysis now falls back to class-only output instead of aborting.
 - For very large dumps, use `--verbose` to monitor parser/analysis progress and timings.
 - Parser supports standard HPROF records used by HotSpot/OpenJDK heap dumps (`STRING`, `LOAD_CLASS`, `HEAP_DUMP`, `HEAP_DUMP_SEGMENT` and core heap sub-records).
 
