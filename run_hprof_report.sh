@@ -5,10 +5,25 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 VENV_DIR="${VENV_DIR:-$SCRIPT_DIR/.venv}"
-BOOTSTRAP_PYTHON="${BOOTSTRAP_PYTHON:-python3}"
+BOOTSTRAP_PYTHON="${BOOTSTRAP_PYTHON:-}"
+
+BOOTSTRAP_CMD=()
+if [[ -n "$BOOTSTRAP_PYTHON" ]]; then
+  BOOTSTRAP_CMD=("$BOOTSTRAP_PYTHON")
+elif command -v python3 >/dev/null 2>&1; then
+  BOOTSTRAP_CMD=(python3)
+elif command -v python >/dev/null 2>&1; then
+  BOOTSTRAP_CMD=(python)
+elif command -v py >/dev/null 2>&1; then
+  BOOTSTRAP_CMD=(py -3)
+else
+  echo "Could not find a Python bootstrap executable (tried: python3, python, py -3)." >&2
+  echo "Set BOOTSTRAP_PYTHON to a valid Python executable path." >&2
+  exit 1
+fi
 
 if [[ ! -x "$VENV_DIR/bin/python" && ! -x "$VENV_DIR/Scripts/python.exe" ]]; then
-  "$BOOTSTRAP_PYTHON" -m venv "$VENV_DIR"
+  "${BOOTSTRAP_CMD[@]}" -m venv "$VENV_DIR"
 fi
 
 if [[ -x "$VENV_DIR/bin/python" ]]; then
