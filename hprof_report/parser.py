@@ -462,7 +462,16 @@ class HprofParser:
 
             extracted: list[tuple[int, list[int]]] = []
             with ThreadPoolExecutor(max_workers=self.workers) as pool:
-                futures = [pool.submit(_extract_pending_refs_chunk, chunk, snapshot.id_size) for chunk in chunks]
+                futures = [
+                    pool.submit(
+                        _extract_pending_refs_chunk,
+                        chunk,
+                        snapshot.id_size,
+                        worker_id,
+                        self.progress,
+                    )
+                    for worker_id, chunk in enumerate(chunks, start=1)
+                ]
                 for fut in futures:
                     extracted.extend(fut.result())
 
@@ -702,7 +711,11 @@ def _format_bytes(value: int) -> str:
 def _extract_pending_refs_chunk(
     chunk: list[tuple[int, bytes, tuple[int, ...]]],
     id_size: int,
+    worker_id: int,
+    progress: ProgressCallback | None = None,
 ) -> list[tuple[int, list[int]]]:
+    if progress is not None:
+        progress(f"ParserDeferred worker={worker_id}: start ({len(chunk):,} instances)")
     out: list[tuple[int, list[int]]] = []
     if id_size == 4:
         unpack_from = struct.unpack_from
@@ -730,4 +743,6 @@ def _extract_pending_refs_chunk(
                 if ref_id != 0:
                     refs.append(ref_id)
             out.append((object_id, refs))
+    if progress is not None:
+        progress(f"ParserDeferred worker={worker_id}: done")
     return out

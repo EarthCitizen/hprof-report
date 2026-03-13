@@ -46,7 +46,7 @@ Optional flags:
 ./run_hprof_report.sh /path/to/heapdump.hprof --verbose
 ```
 
-`--verbose` prints periodic progress and phase timing to stderr so you can tell it is still working on large dumps.
+`--verbose` prints periodic progress and phase timing to stderr so you can tell it is still working on large dumps, including `worker=<n>` tags for parallel phases.
 
 ## Example Output (text)
 

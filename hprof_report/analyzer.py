@@ -323,7 +323,16 @@ def _summarize_by_type(
         counts = {}
         sizes = {}
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(_summarize_type_chunk, snapshot, reachable_ids[start:end]) for start, end in ranges]
+            futures = [
+                pool.submit(
+                    _summarize_type_chunk,
+                    snapshot,
+                    reachable_ids[start:end],
+                    worker_id=worker_idx,
+                    progress=progress,
+                )
+                for worker_idx, (start, end) in enumerate(ranges, start=1)
+            ]
             for fut in futures:
                 chunk_counts, chunk_sizes = fut.result()
                 for type_name, count in chunk_counts.items():
@@ -342,7 +351,12 @@ def _summarize_by_type(
 def _summarize_type_chunk(
     snapshot: HeapSnapshot,
     reachable_ids: Sequence[int],
+    *,
+    worker_id: int | None = None,
+    progress: ProgressCallback | None = None,
 ) -> tuple[dict[str, int], dict[str, int]]:
+    if worker_id is not None and progress is not None:
+        progress(f"ClassSummary worker={worker_id}: start ({len(reachable_ids):,} objects)")
     objects = snapshot.objects
     counts: dict[str, int] = {}
     sizes: dict[str, int] = {}
@@ -354,6 +368,8 @@ def _summarize_type_chunk(
         counts[type_name] = counts.get(type_name, 0) + 1
         sizes[type_name] = sizes.get(type_name, 0) + obj.shallow_size
 
+    if worker_id is not None and progress is not None:
+        progress(f"ClassSummary worker={worker_id}: done")
     return counts, sizes
 
 

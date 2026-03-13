@@ -128,6 +128,7 @@ def build_disk_adjacency(
             succ_offsets=succ_offsets,
             succ_targets=succ_targets,
             worker_count=parallel_workers,
+            progress=progress,
         )
         # Add synthetic-root successor edges after worker fill.
         root_write_pos = int(succ_offsets[root_idx])
@@ -237,13 +238,16 @@ def _fill_successors_parallel(
     succ_offsets,
     succ_targets,
     worker_count: int,
+    progress: ProgressCallback | None = None,
 ) -> None:
     total = len(node_ids)
     if total == 0:
         return
     chunk_size = max(100_000, math.ceil(total / worker_count))
 
-    def worker(start: int, end: int) -> None:
+    def worker(start: int, end: int, worker_id: int) -> None:
+        if progress is not None:
+            progress(f"DiskCSR worker={worker_id}: start rows {start:,}-{end - 1:,}")
         for idx in range(start, end):
             obj = objects_get(node_ids[idx])
             write_pos = int(succ_offsets[idx])
@@ -252,6 +256,8 @@ def _fill_successors_parallel(
                 if target is not None:
                     succ_targets[write_pos] = target
                     write_pos += 1
+        if progress is not None:
+            progress(f"DiskCSR worker={worker_id}: done")
 
     ranges: list[tuple[int, int]] = []
     start = 0
@@ -261,7 +267,7 @@ def _fill_successors_parallel(
         start = end
 
     with ThreadPoolExecutor(max_workers=worker_count) as pool:
-        futures = [pool.submit(worker, start, end) for start, end in ranges]
+        futures = [pool.submit(worker, start, end, worker_id) for worker_id, (start, end) in enumerate(ranges, start=1)]
         for fut in futures:
             fut.result()
 

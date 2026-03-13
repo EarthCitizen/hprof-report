@@ -244,7 +244,15 @@ class MinimalHprofTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch("hprof_report.disk_graph.CSR_PARALLEL_MIN", 1):
             ram_result = analyze_snapshot(snapshot, top_n=10, engine="ram", workers=1)
-            disk_result = analyze_snapshot(snapshot, top_n=10, engine="disk", work_dir=tmp, workers=2)
+            messages: list[str] = []
+            disk_result = analyze_snapshot(
+                snapshot,
+                top_n=10,
+                engine="disk",
+                work_dir=tmp,
+                workers=2,
+                progress=messages.append,
+            )
 
         self.assertEqual(disk_result.reachable_count, ram_result.reachable_count)
         self.assertEqual(disk_result.non_collectable_size, ram_result.non_collectable_size)
@@ -256,6 +264,7 @@ class MinimalHprofTests(unittest.TestCase):
             {row.object_id: row.retained_size for row in disk_result.top_retainers},
             {row.object_id: row.retained_size for row in ram_result.top_retainers},
         )
+        self.assertTrue(any("DiskCSR worker=" in msg for msg in messages))
 
     def test_class_summary_parallel_matches_serial(self) -> None:
         snapshot = HeapSnapshot(id_size=4, version="test")
@@ -268,13 +277,21 @@ class MinimalHprofTests(unittest.TestCase):
 
         with mock.patch("hprof_report.analyzer.SUMMARY_PARALLEL_MIN", 1):
             serial = analyze_snapshot(snapshot, include_dominator=False, workers=1, top_n=10)
-            parallel = analyze_snapshot(snapshot, include_dominator=False, workers=4, top_n=10)
+            messages: list[str] = []
+            parallel = analyze_snapshot(
+                snapshot,
+                include_dominator=False,
+                workers=4,
+                top_n=10,
+                progress=messages.append,
+            )
 
         self.assertEqual(
             [(row.type_name, row.object_count, row.shallow_size) for row in parallel.class_summaries],
             [(row.type_name, row.object_count, row.shallow_size) for row in serial.class_summaries],
         )
         self.assertEqual(parallel.non_collectable_size, serial.non_collectable_size)
+        self.assertTrue(any("ClassSummary worker=" in msg for msg in messages))
 
     def test_parser_parallel_pending_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -295,11 +312,13 @@ class MinimalHprofTests(unittest.TestCase):
             records.append(_record(0x0C, heap))
             hprof.write_bytes(header + b"".join(records))
 
+            messages: list[str] = []
             with mock.patch("hprof_report.parser.PARSER_PARALLEL_PENDING_MIN", 1):
-                snapshot = HprofParser(workers=2).parse(hprof)
+                snapshot = HprofParser(workers=2, progress=messages.append).parse(hprof)
 
             self.assertIn(0x200, snapshot.objects)
             self.assertIn(0x300, snapshot.objects[0x200].refs)
+            self.assertTrue(any("ParserDeferred worker=" in msg for msg in messages))
 
     def test_dominator_fallback_on_edge_index_memory_error(self) -> None:
         snapshot = HeapSnapshot(id_size=4, version="test")
